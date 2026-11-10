@@ -1,13 +1,7 @@
-
 {
   "name": "pokemon-upc-restock",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "scripts": {
-    "dev": "node index.js",
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "node-telegram-bot-api": "^0.66.0"
-  }
-}
+  "engines": {"node": ">=18"},
+  "scripts": {"start": "node index.js", "check": "node --check index.js"},
+  "dependencies": {}
