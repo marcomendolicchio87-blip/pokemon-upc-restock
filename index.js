@@ -3,61 +3,78 @@ const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
-
-if (!token) {
-  throw new Error('Token Telegram mancante');
-}
+if (!token) throw new Error('Token Telegram mancante');
 
 const bot = new TelegramBot(token, { polling: true });
 
-// Pagine da controllare
 const products = [
   {
-    name: 'Pokémon UPC 30° Anniversario - Giorno',
+    name: 'UPC Giorno - Card Restock Tracker',
+    type: 'card',
     url: 'https://cardrestocktracker.com/it/30-anniversario-ultra-premium-collection-versione-giorno-1h6cvz1'
   },
   {
-    name: 'Pokémon UPC 30° Anniversario - Notte',
+    name: 'UPC Notte - Card Restock Tracker',
+    type: 'card',
     url: 'https://cardrestocktracker.com/it/30-anniversario-ultra-premium-collection-versione-notte-bqq9av'
+  },
+  {
+    name: 'UPC Giorno - Pokemonitor',
+    type: 'pokemonitor',
+    url: 'https://pokemonitoritalia.com/set/megaevoluzioni/30-anniversario/collezione-ultra-premium-giornata'
+  },
+  {
+    name: 'UPC Notte - Pokemonitor',
+    type: 'pokemonitor',
+    url: 'https://pokemonitoritalia.com/set/megaevoluzioni/30-anniversario/collezione-ultra-premium-serata'
   }
 ];
 
 const subscribersFile = './subscribers.json';
+const stateFile = './availability.json';
+
 let subscribers = new Set();
+let previous = {};
 
 try {
   if (fs.existsSync(subscribersFile)) {
     subscribers = new Set(JSON.parse(fs.readFileSync(subscribersFile)));
   }
+  if (fs.existsSync(stateFile)) {
+    previous = JSON.parse(fs.readFileSync(stateFile));
+  }
 } catch (error) {
-  console.error('Errore lettura iscritti:', error.message);
+  console.log('Lettura dati iniziali:', error.message);
 }
 
-function saveSubscribers() {
-  fs.writeFileSync(
-    subscribersFile,
-    JSON.stringify([...subscribers])
-  );
+function saveData() {
+  fs.writeFileSync(subscribersFile, JSON.stringify([...subscribers]));
+  fs.writeFileSync(stateFile, JSON.stringify(previous));
 }
 
-const previousAvailability = {};
-let checking = false;
+async function notify(message) {
+  for (const id of subscribers) {
+    try {
+      await bot.sendMessage(id, message);
+    } catch (error) {
+      console.log('Errore invio:', error.message);
+    }
+  }
+}
 
 async function checkProduct(product) {
   try {
     const response = await fetch(product.url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0'
-      },
-      signal: AbortSignal.timeout(15000)
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(20000)
     });
 
     if (!response.ok) {
-      throw new Error('Risposta del sito: ' + response.status);
+      throw new Error('HTTP ' + response.status);
     }
 
     const html = await response.text();
-    const page = html
+    const text = html
       .replace(/<script[\s\S]*?<\/script>/gi, ' ')
       .replace(/<style[\s\S]*?<\/style>/gi, ' ')
       .replace(/<[^>]*>/g, ' ')
@@ -66,63 +83,77 @@ async function checkProduct(product) {
       .replace(/&agrave;/g, 'à')
       .replace(/\s+/g, ' ');
 
-    const match = page.match(
-      /è disponibile in\s+(\d+)\s+negozi?\s+su\s+(\d+)/i
-    );
+    let available = null;
+    let total = null;
 
-    if (!match) {
-      console.log('Disponibilità non leggibile:', product.name);
+    if (product.type === 'pokemonitor') {
+      const match = text.match(
+        /Negozi con prodotto disponibile:\s*(\d+)\s+su\s+(\d+)/i
+      );
+
+      if (match) {
+        available = Number(match[1]);
+        total = Number(match[2]);
+      }
+    } else {
+      const match = text.match(
+        /disponibile in\s+(\d+)\s+negozi?\s+su\s+(\d+)/i
+      );
+
+      if (match) {
+        available = Number(match[1]);
+        total = Number(match[2]);
+      }
+    }
+
+    if (available === null) {
+      console.log('Disponibilità non letta:', product.name);
       return;
     }
 
-    const available = Number(match[1]);
-    const total = Number(match[2]);
-    const previous = previousAvailability[product.name];
-
     console.log(
-      product.name + ': ' + available + ' negozi disponibili su ' + total
+      product.name + ': ' + available + ' su ' + total
     );
 
-    previousAvailability[product.name] = available;
+    const old = previous[product.name];
 
-    // Primo controllo: avvisa se il prodotto è già disponibile
-    if (previous === undefined && available > 0) {
-      await sendAlert(
-        '🔔 DISPONIBILITÀ RILEVATA!\n\n' +
-        product.name +
-        '\nNegozi disponibili: ' + available +
-        '\n\nControlla qui:\n' + product.url
-      );
+    if (old === undefined) {
+      previous[product.name] = available;
+      saveData();
+
+      if (available > 0) {
+        await notify(
+          '🔔 DISPONIBILITÀ RILEVATA\n\n' +
+          product.name +
+          '\nNegozi disponibili: ' + available + ' su ' + total +
+          '\n\nControlla:\n' + product.url
+        );
+      }
+
+      return;
     }
 
-    // Controlli successivi: avvisa quando torna disponibile
-    if (previous !== undefined && previous === 0 && available > 0) {
-      await sendAlert(
-        '🚨 RESTOCK RILEVATO!\n\n' +
+    if (available > old) {
+      await notify(
+        '🚨 POSSIBILE RESTOCK!\n\n' +
         product.name +
-        '\nNegozi disponibili: ' + available +
+        '\nNegozi disponibili: ' + available + ' su ' + total +
         '\n\nCONTROLLA SUBITO:\n' + product.url
       );
     }
 
+    previous[product.name] = available;
+    saveData();
+
   } catch (error) {
-    console.error('Errore controllo ' + product.name + ':', error.message);
+    console.log('Errore ' + product.name + ':', error.message);
   }
 }
 
-async function sendAlert(message) {
-  for (const chatId of subscribers) {
-    try {
-      await bot.sendMessage(chatId, message);
-    } catch (error) {
-      console.error('Errore invio Telegram:', error.message);
-    }
-  }
-}
+let checking = false;
 
-async function checkAllProducts() {
+async function checkAll() {
   if (checking) return;
-
   checking = true;
 
   try {
@@ -136,46 +167,41 @@ async function checkAllProducts() {
 
 bot.onText(/\/start/, async (msg) => {
   subscribers.add(msg.chat.id);
-  saveSubscribers();
+  saveData();
 
   await bot.sendMessage(
     msg.chat.id,
     '🐾 Pokémon UPC Restock Italia attivo!\n\n' +
-    'Ti avviserò quando rileverò un ritorno di disponibilità.\n\n' +
-    'Controllo automatico ogni 5 minuti.\n\n' +
-    'Comandi disponibili:\n' +
-    '/status - stato del monitoraggio\n' +
+    'Monitoraggio di 4 pagine:\n' +
+    '• Giorno e Notte\n' +
+    '• Card Restock Tracker\n' +
+    '• Pokemonitor Italia\n\n' +
+    'Controllo ogni 5 minuti.\n\n' +
+    '/status - stato del bot\n' +
     '/check - controllo immediato'
   );
 });
 
 bot.onText(/\/status/, async (msg) => {
-  await bot.sendMessage(
+  bot.sendMessage(
     msg.chat.id,
     '✅ Bot attivo.\n' +
-    'Prodotti monitorati: 2\n' +
+    'Pagine monitorate: 4\n' +
     'Intervallo: 5 minuti.'
   );
 });
 
 bot.onText(/\/check/, async (msg) => {
-  await bot.sendMessage(msg.chat.id, '🔎 Controllo le disponibilità...');
-
-  for (const product of products) {
-    await checkProduct(product);
-  }
-
-  await bot.sendMessage(msg.chat.id, 'Controllo terminato.');
+  await bot.sendMessage(msg.chat.id, '🔎 Controllo in corso...');
+  await checkAll();
+  await bot.sendMessage(msg.chat.id, '✅ Controllo terminato.');
 });
 
 bot.on('polling_error', (error) => {
-  console.error('Errore Telegram:', error.message);
+  console.log('Errore Telegram:', error.message);
 });
 
-console.log('🐾 Bot Pokémon UPC avviato!');
+console.log('🐾 Pokémon UPC Restock Italia avviato');
 
-// Primo controllo immediato
-checkAllProducts();
-
-// Controllo automatico ogni 5 minuti
-setInterval(checkAllProducts, 5 * 60 * 1000);
+checkAll();
+setInterval(checkAll, 5 * 60 * 1000);
