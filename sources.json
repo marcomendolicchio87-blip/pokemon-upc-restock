@@ -58,5 +58,83 @@
     "type": "shop",
     "variant": "pair",
     "url": "https://www.safaridex.it/prodotto/pokemon-30-anniversario-coppia-ultra-premium-giorno-notte-it-49089"
+  },
+  {
+    "name": "MagicNerd Giorno",
+    "type": "shop",
+    "variant": "giorno",
+    "url": "https://magicnerd.it/products/collezione-ultra-premium-30-anniversario-giornata-espeon-ita"
+  },
+  {
+    "name": "MagicNerd Notte",
+    "type": "shop",
+    "variant": "notte",
+    "url": "https://magicnerd.it/products/collezione-ultra-premium-30-anniversario-serata-umbreon-ita"
+  },
+  {
+    "name": "Amazon Drop Giorno",
+    "type": "tracker",
+    "variant": "giorno",
+    "url": "https://www.pokedropalert.com/amazon-drop"
+  },
+  {
+    "name": "Amazon Drop Notte",
+    "type": "tracker",
+    "variant": "notte",
+    "url": "https://www.pokedropalert.com/amazon-drop"
+  },
+  {
+    "name": "Cardmarket Espeon Giorno",
+    "type": "tracker",
+    "variant": "giorno",
+    "url": "https://www.cardmarket.com/it/Pokemon/Products/Box-Sets/30th-Celebration-Espeon-Ultra-Premium-Collection"
+  },
+  {
+    "name": "Cardmarket Umbreon Notte",
+    "type": "tracker",
+    "variant": "notte",
+    "url": "https://www.cardmarket.com/it/Pokemon/Products/Box-Sets/30th-Celebration-Umbreon-Ultra-Premium-Collection"
+  },
+  {
+    "name": "Amazon Bundle Giorno+Notte",
+    "type": "tracker",
+    "variant": "pair",
+    "url": "https://www.amazon.it/Pokemon-Anniversario-Collezioni-Umbreon-ex-Espeon-ex/dp/B0HNPR8SK5"
+  },
+  {
+    "name": "eBay Giorno (API ufficiale)",
+    "type": "ebay_api",
+    "variant": "giorno",
+    "url": "https://www.ebay.it/sch/i.html?_nkw=pokemon+30+anniversario+ultra+premium"
+  },
+  {
+    "name": "Vinted Giorno (ricerca manuale)",
+    "type": "manual",
+    "variant": "giorno",
+    "url": "https://www.vinted.it/catalog?search_text=pokemon%2030%20anniversario%20ultra%20premium"
+  },
+  {
+    "name": "eBay Notte (API ufficiale)",
+    "type": "ebay_api",
+    "variant": "notte",
+    "url": "https://www.ebay.it/sch/i.html?_nkw=pokemon+30+anniversario+ultra+premium"
+  },
+  {
+    "name": "Vinted Notte (ricerca manuale)",
+    "type": "manual",
+    "variant": "notte",
+    "url": "https://www.vinted.it/catalog?search_text=pokemon%2030%20anniversario%20ultra%20premium"
+  },
+  {
+    "name": "eBay Pair (API ufficiale)",
+    "type": "ebay_api",
+    "variant": "pair",
+    "url": "https://www.ebay.it/sch/i.html?_nkw=pokemon+30+anniversario+ultra+premium"
+  },
+  {
+    "name": "Vinted Pair (ricerca manuale)",
+    "type": "manual",
+    "variant": "pair",
+    "url": "https://www.vinted.it/catalog?search_text=pokemon%2030%20anniversario%20ultra%20premium"
   }
 ]
