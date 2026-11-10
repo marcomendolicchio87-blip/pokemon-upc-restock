@@ -8,7 +8,7 @@ const CONCURRENCY=Math.max(1,Math.min(8,Number(process.env.SOURCE_CONCURRENCY)||
 const REQUEST_TIMEOUT=Math.max(3000,Math.min(30000,Number(process.env.REQUEST_TIMEOUT_MS)||10000));
 const MAX_BOX=Number(process.env.MAX_BOX_EUR)||300, MAX_PAIR=Number(process.env.MAX_PAIR_EUR)||600;
 const SOURCES=JSON.parse(fs.readFileSync(path.join(__dirname,'sources.json'),'utf8'));
-if(!Array.isArray(SOURCES)||!SOURCES.every(s=>s.name&&/^https:\/\//.test(s.url)&&['shop','tracker'].includes(s.type)&&['giorno','notte','pair'].includes(s.variant)))throw Error('sources.json non valido');
+if(!Array.isArray(SOURCES)||!SOURCES.every(s=>s.name&&/^https:\/\//.test(s.url)&&['shop','tracker','ebay_api','manual'].includes(s.type)&&['giorno','notte','pair'].includes(s.variant)))throw Error('sources.json non valido');
 const SOURCE_ALERT_HOURS=Math.max(1,Number(process.env.SOURCE_ALERT_HOURS)||12);
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const log=(...v)=>console.log(new Date().toISOString(),...v);
@@ -42,7 +42,78 @@ function links(html,base){
   return out;
 }
 function isSearch(u){try{const x=new URL(u);return /(^|\.)(amazon\.|ebay\.|cardmarket\.)/.test(x.hostname)&&(/\/sch\/|\/search|\/s\b/.test(x.pathname)||x.searchParams.has('k'))}catch{return true}}
-async function inspect(s){const page=await fetchPage(s.url);if(s.type==='shop')return {offers:[...structured(page.body,s,page.url),...await shopify(s,page.url)],note:'pagina prodotto raggiungibile (stock da verificare)'};
+// Pokémonitor often displays store availability but locks the outgoing "Acquista ora"
+// links behind authentication. Read its public overview for diagnostics only;
+// NEVER turn a tracker price into a purchasable offer.
+function pokemonitorOverview(html){
+  const text=decodeHtml(html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi,' ').replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi,' ').replace(/<[^>]+>/g,' ').replace(/\s+/g,' '));
+  const offersHeading=/Offerte dei negozi|Negozi con il prodotto/i.test(text);
+  const count=(text.match(/Negozi con il prodotto\s*(\d+)\s*su\s*(\d+)/i)||[]);
+  const min=(text.match(/Prezzo minimo disponibile\s*€\s*([\d.,]+)/i)||[]);
+  const soldOut=/(?:Non disponibile|Negozi con il prodotto\s*0\s*su)/i.test(text);
+  return {readable:offersHeading,availableCount:count[1]?Number(count[1]):null,totalCount:count[2]?Number(count[2]):null,minAvailablePrice:min[1]?price(min[1]):null,soldOut};
+}
+// Public store names are leads, not purchase links. Only match known direct
+// product URLs already configured in sources.json; never guess a product slug.
+const STORE_ALIASES={magicnerd:['magicnerd'],cardgameclub:['cardgameclub'],takicardz:['takicardz'],pokechrono:['pokechrono']};
+function storeKey(name){const compact=String(name||'').toLowerCase().replace(/[^a-z0-9]/g,'');return Object.keys(STORE_ALIASES).find(k=>STORE_ALIASES[k].includes(compact))||null}
+function pokemonitorLeads(html,which){
+ const text=decodeHtml(html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi,' ').replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi,' ').replace(/<[^>]+>/g,' ').replace(/\s+/g,' '));
+ const known=['MagicNerd','CardGameClub','TakiCardz','Pokechrono'];
+ const leads=[];
+ for(const store of known){
+  const re=new RegExp('(?:^|\\s)'+store+'\\s+(Disponibile|Esaurito|Non disponibile)\\b','gi');
+  let m;while((m=re.exec(text))){
+   const window=text.slice(m.index,m.index+250);
+   const eur=window.match(/€\s*([\d.,]+)/);
+   leads.push({store,status:/^disponibile$/i.test(m[1])?'available':'out',price:eur?price(eur[1]):null,variant:which});
+  }
+ }
+ return leads;
+}
+async function verifyPokemonitorLeads(html,tracker){
+ const leads=pokemonitorLeads(html,tracker.variant);
+ const eligible=leads.filter(l=>l.status==='available'&&l.price!==null&&l.price>0&&l.price<=(l.variant==='pair'?MAX_PAIR:MAX_BOX));
+ const matched=[];for(const l of eligible){
+  const direct=SOURCES.find(x=>x.type==='shop'&&x.variant===l.variant&&storeKey(x.name.split(' ')[0])===storeKey(l.store));
+  if(direct&&!matched.some(x=>x.url===direct.url))matched.push(direct);
+ }
+ const offers=[];let checked=0,blocked=0;
+ await parallel(matched,Math.min(3,CONCURRENCY),async direct=>{
+  try{const page=await fetchPage(direct.url);checked++;offers.push(...structured(page.body,direct,page.url),...await shopify(direct,page.url))}
+  catch(e){blocked++;log('POKEMONITOR SHOP VERIFY FAILED',direct.name,e.message)}
+ });
+ return {leads,eligible:eligible.length,matched:matched.length,checked,blocked,offers};
+}
+let ebayTokenCache={token:null,until:0};
+async function ebayToken(){
+ if(ebayTokenCache.token&&Date.now()<ebayTokenCache.until)return ebayTokenCache.token;
+ const id=process.env.EBAY_CLIENT_ID,secret=process.env.EBAY_CLIENT_SECRET;
+ if(!id||!secret)throw Error('API eBay non configurata: richiede EBAY_CLIENT_ID e EBAY_CLIENT_SECRET');
+ const ac=new AbortController(),timer=setTimeout(()=>ac.abort(),REQUEST_TIMEOUT);
+ try{const r=await fetch('https://api.ebay.com/identity/v1/oauth2/token',{method:'POST',headers:{authorization:'Basic '+Buffer.from(id+':'+secret).toString('base64'),'content-type':'application/x-www-form-urlencoded'},body:'grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope',signal:ac.signal});if(!r.ok)throw Error('eBay OAuth HTTP '+r.status);const j=await r.json();if(!j.access_token)throw Error('eBay OAuth senza token');ebayTokenCache={token:j.access_token,until:Date.now()+Math.max(60000,(j.expires_in||7200)*1000-120000)};return j.access_token}finally{clearTimeout(timer)}
+}
+function ebayOffers(items,s){const out=[];for(const x of items||[]){
+ const title=String(x.title||'');if(!relevant(title,s.variant))continue;
+ if(/lotto vuoto|box vuot|empty|solo carta|single card|proxy|custom|digital|replica|riproduzion|apert[oa]|usato|loose|pack only|booster singol/i.test(title))continue;
+ if(!/sigillat|sealed|nuov|new|preordin|pre-order|preorder/i.test(title))continue;
+ if(x.buyingOptions&&!x.buyingOptions.includes('FIXED_PRICE'))continue;
+ const n=price(x.price?.value),cur=x.price?.currency,link=url(x.itemWebUrl||'', 'https://www.ebay.it');
+ if(!n||cur!=='EUR'||!link||!/^https:\/\/(?:www\.)?ebay\.(?:it|com)\//i.test(link))continue;
+ if(x.conditionId&&String(x.conditionId)!=='1000'&&!/new|nuov/i.test(x.condition||''))continue;
+ if(x.shippingOptions?.length){const costs=x.shippingOptions.map(z=>price(z.shippingCost?.value)).filter(z=>z!==null);if(costs.length&&n+Math.min(...costs)>(s.variant==='pair'?MAX_PAIR:MAX_BOX))continue}
+ if(n>(s.variant==='pair'?MAX_PAIR:MAX_BOX))continue;
+ out.push({name:s.name,variant:s.variant,price:n,status:/preordin|pre-order|preorder/i.test(title)?'preorder':'available',url:link,proof:'eBay Browse API: prezzo e annuncio attivo; verifica confezione e spedizione',shipping:'da verificare al checkout'});
+ }return out}
+async function ebayInspect(s){const token=await ebayToken();const q=s.variant==='giorno'?'pokemon 30 anniversario ultra premium espeon':s.variant==='notte'?'pokemon 30 anniversario ultra premium umbreon':'pokemon 30 anniversario ultra premium espeon umbreon';const endpoint=new URL('https://api.ebay.com/buy/browse/v1/item_summary/search');endpoint.searchParams.set('q',q);endpoint.searchParams.set('limit','50');endpoint.searchParams.set('filter','buyingOptions:{FIXED_PRICE},priceCurrency:EUR');const ac=new AbortController(),timer=setTimeout(()=>ac.abort(),REQUEST_TIMEOUT);try{const r=await fetch(endpoint,{headers:{authorization:'Bearer '+token,'x-ebay-c-marketplace-id':'EBAY_IT','accept-language':'it-IT','accept':'application/json'},signal:ac.signal});if(!r.ok)throw Error('eBay Browse API HTTP '+r.status);const j=await r.json();const offers=ebayOffers(j.itemSummaries||[],s);return {offers,note:`eBay API: ${(j.itemSummaries||[]).length} annunci esaminati, ${offers.length} candidati entro budget (spese da verificare)`}}finally{clearTimeout(timer)}}
+async function inspect(s){if(s.type==='manual')return {offers:[],coverage:'manual',note:'solo ricerca manuale: monitoraggio automatico non disponibile'};if(s.type==='ebay_api')return ebayInspect(s);const page=await fetchPage(s.url);if(s.type==='shop')return {offers:[...structured(page.body,s,page.url),...await shopify(s,page.url)],note:'pagina prodotto raggiungibile (stock da verificare)'};
+if(new URL(s.url).hostname.replace(/^www\./,'')==='pokemonitoritalia.com'){
+ const overview=pokemonitorOverview(page.body);
+ const recovery=await verifyPokemonitorLeads(page.body,s);
+ const note=`elenco pubblico: ${overview.readable?'letto':'non interpretabile'}; ${recovery.leads.length} negozi noti riconosciuti, ${recovery.eligible} segnalazioni entro budget e disponibili, ${recovery.matched} URL diretti già noti, ${recovery.checked} negozi verificati, ${recovery.blocked} bloccati; ${recovery.offers.length} offerte confermate sul negozio`;
+ return {offers:recovery.offers,candidates:recovery.matched,verified:recovery.offers.length,inspected:recovery.checked,blocked:recovery.blocked,overview,coverage:recovery.offers.length?'verified-offers':'tracker-data-only',note};
+}
+
 // Tracker discovery only: tracker text never proves stock. Follow direct product pages only.
 const candidates=links(page.body,page.url).filter(x=>{
   try{const u=new URL(x.url);return u.protocol==='https:'&&!isSearch(x.url)}catch{return false}
@@ -85,7 +156,7 @@ async function parallel(items,limit,fn){
 async function check(){if(checking)return 'Controllo già in corso';checking=true;const offers=[];let errors=0;try{await parallel(SOURCES,CONCURRENCY,async s=>{
   try{
     const r=await inspect(s);
-    state.health[s.name]={ok:true,coverage:s.type==='tracker'?(r.verified>0?'verified-offers':r.candidates>0?'links-unverified':'no-links'):'shop',note:r.note,offers:r.offers.length,at:new Date().toISOString()};
+    state.health[s.name]={ok:true,coverage:s.type==='manual'?'manual':s.type==='ebay_api'?'api':s.type==='tracker'?(r.coverage||(r.verified>0?'verified-offers':r.candidates>0?'links-unverified':'no-links')):'shop',note:r.note,offers:r.offers.length,at:new Date().toISOString()};
     offers.push(...r.offers);
     log('SOURCE OK',s.name,r.note,'offers='+r.offers.length);
   }catch(e){
@@ -94,7 +165,7 @@ async function check(){if(checking)return 'Controllo già in corso';checking=tru
     log('SOURCE FAILED',s.name,e.message);
   }
 });
-const failed=SOURCES.filter(s=>state.health[s.name]&&(!state.health[s.name].ok||['no-links','links-unverified'].includes(state.health[s.name].coverage)));
+const failed=SOURCES.filter(s=>state.health[s.name]&&s.type!=='manual'&&(!state.health[s.name].ok||['no-links','links-unverified','tracker-data-only'].includes(state.health[s.name].coverage)));
 const now=Date.now();
 if(failed.length&&(!state.lastHealthAlert||now-state.lastHealthAlert>=SOURCE_ALERT_HOURS*3600000)){
   const text='⚠️ MONITORAGGIO PARZIALE: '+failed.length+' fonti senza verifica completa:\n'+failed.map(s=>'• '+s.name+': '+state.health[s.name].note).join('\n')+'\nAltre fonti continuano a essere controllate.';
@@ -117,9 +188,9 @@ for(const sentKey of Object.keys(state.sent)){
   state.missing[sentKey]=(state.missing[sentKey]||0)+1;
   if(state.missing[sentKey]>=REARM_MISSING_CHECKS){delete state.sent[sentKey];delete state.missing[sentKey];delete state.sentSource?.[sentKey]}
 }
-const chats=[...new Set([...state.chats,...(process.env.TELEGRAM_CHAT_ID?[String(process.env.TELEGRAM_CHAT_ID)]:[])])];let sent=0;for(const o of valid){const message=`🚨 Pokémon UPC 30° Anniversario\n📦 ${o.variant==='giorno'?'Giorno / Espeon':o.variant==='notte'?'Notte / Umbreon':'Coppia Giorno + Notte'}\n🏬 ${o.name}\n💶 ${o.price.toFixed(2)} €\n🟢 ${o.status==='preorder'?'Preordine':'Disponibile'}\n🚚 Spedizione in Italia: ${o.shipping}\n🔗 ${o.url}\n🔍 Fonte: ${o.proof}\n⚠️ Verifica al checkout.`;for(const chat of chats){const k=o.key+':'+chat;if(state.sent[k])continue;if(await send(chat,message)){state.sent[k]=Date.now();state.sentSource ||= {};state.sentSource[k]=o.name;sent++;log('ALERT DELIVERED',o.name,o.variant,o.price,'chat='+chat);save()}}}state.last={at:new Date().toISOString(),sources:SOURCES.length,errors,offers:valid.length,sent};save();log('CHECK COMPLETE',JSON.stringify(state.last));return `${SOURCES.length} fonti, ${errors} errori HTTP, ${SOURCES.filter(s=>['no-links','links-unverified'].includes(state.health[s.name]?.coverage)).length} tracker con copertura limitata, ${valid.length} offerte VERIFICATE entro budget, ${sent} notifiche inviate`}finally{checking=false}}
-async function handle(u){const m=u.message;if(!m?.chat?.id||typeof m.text!=='string')return;const chat=String(m.chat.id),cmd=m.text.trim().split(/\s+/)[0].split('@')[0].toLowerCase();if(cmd==='/start'){if(!state.chats.includes(chat)){state.chats.push(chat);save()}await send(chat,'✅ Iscritto. Comandi: /test /testalert /check /status /sources /health /stop')}else if(cmd==='/test')await send(chat,'✅ Telegram operativo. Questo non prova il rilevamento dei restock.');else if(cmd==='/testalert')await send(chat,'🧪 SIMULAZIONE, NON È UN RESTOCK REALE\n🚨 Pokémon UPC Notte / Umbreon\n🏬 Negozio TEST\n💶 249,90 €\n🟢 Disponibile (simulazione)\n🚚 Italia: non verificata\n🔗 Nessun link di acquisto');else if(cmd==='/health'){const failed=SOURCES.filter(s=>state.health[s.name]&&(!state.health[s.name].ok||['no-links','links-unverified'].includes(state.health[s.name].coverage)));await send(chat,failed.length?'⚠️ Fonti con copertura limitata o errori:\n'+failed.map(s=>s.name+' — '+state.health[s.name].note).join('\n'):'✅ Nessuna fonte in errore nell’ultimo controllo. Questo non certifica la disponibilità.')}else if(cmd==='/check'){await send(chat,'🔎 Controllo avviato');void check().then(r=>send(chat,r)).catch(e=>log('CHECK COMMAND FAILED',e.message))}else if(cmd==='/status')await send(chat,`🤖 Attivo\n${JSON.stringify(state.last||'Nessun controllo')}\nBudget: ${MAX_BOX} € / scatola, ${MAX_PAIR} € / coppia`);else if(cmd==='/sources'){const lines=SOURCES.map(s=>{const h=state.health[s.name];return `${['no-links','links-unverified'].includes(h?.coverage)?'⚠️':h?.ok?'✅':h?'❌':'⏳'} ${s.name}: ${h?.note||'non controllata'}\n🔗 ${s.url}`});await send(chat,lines.join('\n'))}else if(cmd==='/stop'){state.chats=state.chats.filter(x=>x!==chat);save();await send(chat,'Notifiche disattivate')}}
+const chats=[...new Set([...state.chats,...(process.env.TELEGRAM_CHAT_ID?[String(process.env.TELEGRAM_CHAT_ID)]:[])])];let sent=0;for(const o of valid){const message=`🚨 Pokémon UPC 30° Anniversario\n📦 ${o.variant==='giorno'?'Giorno / Espeon':o.variant==='notte'?'Notte / Umbreon':'Coppia Giorno + Notte'}\n🏬 ${o.name}\n💶 ${o.price.toFixed(2)} €\n🟢 ${o.status==='preorder'?'Preordine':'Disponibile'}\n🚚 Spedizione in Italia: ${o.shipping}\n🔗 ${o.url}\n🔍 Fonte: ${o.proof}\n⚠️ Verifica al checkout.`;for(const chat of chats){const k=o.key+':'+chat;if(state.sent[k])continue;if(await send(chat,message)){state.sent[k]=Date.now();state.sentSource ||= {};state.sentSource[k]=o.name;sent++;log('ALERT DELIVERED',o.name,o.variant,o.price,'chat='+chat);save()}}}state.last={at:new Date().toISOString(),sources:SOURCES.length,errors,offers:valid.length,sent};save();log('CHECK COMPLETE',JSON.stringify(state.last));return `${SOURCES.length} fonti configurate (${SOURCES.filter(s=>s.type!=='manual').length} automatiche), ${errors} errori,  ${SOURCES.filter(s=>['no-links','links-unverified','tracker-data-only'].includes(state.health[s.name]?.coverage)).length} tracker senza link d'acquisto verificabile, ${valid.length} offerte VERIFICATE entro budget, ${sent} notifiche inviate`}finally{checking=false}}
+async function handle(u){const m=u.message;if(!m?.chat?.id||typeof m.text!=='string')return;const chat=String(m.chat.id),cmd=m.text.trim().split(/\s+/)[0].split('@')[0].toLowerCase();if(cmd==='/start'){if(!state.chats.includes(chat)){state.chats.push(chat);save()}await send(chat,'✅ Iscritto. Comandi: /test /testalert /check /status /sources /health /stop')}else if(cmd==='/test')await send(chat,'✅ Telegram operativo. Questo non prova il rilevamento dei restock.');else if(cmd==='/testalert')await send(chat,'🧪 SIMULAZIONE, NON È UN RESTOCK REALE\n🚨 Pokémon UPC Notte / Umbreon\n🏬 Negozio TEST\n💶 249,90 €\n🟢 Disponibile (simulazione)\n🚚 Italia: non verificata\n🔗 Nessun link di acquisto');else if(cmd==='/health'){const failed=SOURCES.filter(s=>state.health[s.name]&&s.type!=='manual'&&(!state.health[s.name].ok||['no-links','links-unverified','tracker-data-only'].includes(state.health[s.name].coverage)));await send(chat,failed.length?'⚠️ Fonti con copertura limitata o errori:\n'+failed.map(s=>s.name+' — '+state.health[s.name].note).join('\n'):'✅ Nessuna fonte in errore nell’ultimo controllo. Questo non certifica la disponibilità.')}else if(cmd==='/check'){await send(chat,'🔎 Controllo avviato');void check().then(r=>send(chat,r)).catch(e=>log('CHECK COMMAND FAILED',e.message))}else if(cmd==='/status')await send(chat,`🤖 Attivo\n${JSON.stringify(state.last||'Nessun controllo')}\nBudget: ${MAX_BOX} € / scatola, ${MAX_PAIR} € / coppia`);else if(cmd==='/sources'){const lines=SOURCES.map(s=>{const h=state.health[s.name];return `${h?.coverage==='manual'?'🔎':['no-links','links-unverified','tracker-data-only'].includes(h?.coverage)?'⚠️':h?.ok?'✅':h?'❌':'⏳'} ${s.name}: ${h?.note||'non controllata'}\n🔗 ${s.url}`});await send(chat,lines.join('\n'))}else if(cmd==='/stop'){state.chats=state.chats.filter(x=>x!==chat);save();await send(chat,'Notifiche disattivate')}}
 async function poll(){while(true){try{const updates=await api('getUpdates',{offset:state.offset,timeout:25,allowed_updates:['message']});for(const u of updates){try{await handle(u)}catch(e){log('COMMAND FAILED',e.message)}state.offset=u.update_id+1;save()}}catch(e){log('POLL ERROR',e.message);await sleep(5000)}}}
 async function main(){if(!TOKEN)throw Error('Manca TELEGRAM_BOT_TOKEN');if(!process.env.DATA_DIR)log('WARNING: DATA_DIR non impostato: lo storico potrebbe perdersi dopo un deploy Railway. Configura volume /data e DATA_DIR=/data');await api('deleteWebhook',{drop_pending_updates:false});const me=await api('getMe');log('TELEGRAM AUTH OK',me.username);log('MONITOR STARTED',SOURCES.length,'sources','interval='+INTERVAL,'concurrency='+CONCURRENCY);void poll();setInterval(()=>void check(),INTERVAL);await check()}
 if(require.main===module)main().catch(e=>{log('FATAL',e.message);process.exitCode=1});
-module.exports={price,variant,relevant,availability,structured,unique,links,isSearch,url,shopify,inspect};
+module.exports={price,variant,relevant,availability,structured,unique,links,isSearch,url,shopify,inspect,pokemonitorOverview,pokemonitorLeads,storeKey,ebayOffers};
