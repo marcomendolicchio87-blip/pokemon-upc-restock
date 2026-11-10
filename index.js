@@ -1,542 +1,71 @@
-
 'use strict';
-
-const TelegramBot = require('node-telegram-bot-api');
-const fs = require('fs');
-const path = require('path');
+// Node.js 18+; no external packages required.
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-if (!TOKEN) throw new Error('Variabile TELEGRAM_BOT_TOKEN mancante');
-
-const INTERVAL = 60_000;
-const MAX_PRICE = 300;
-const TIMEOUT = 18_000;
+if (!TOKEN) { console.error('Missing TELEGRAM_BOT_TOKEN'); process.exit(1); }
+const API = `https://api.telegram.org/bot${TOKEN}`;
+const INTERVAL = Math.max(60000, Number(process.env.CHECK_INTERVAL_MS || 60000));
+const MAX_BOX = Number(process.env.MAX_BOX_EUR || 300);
+const MAX_PAIR = Number(process.env.MAX_PAIR_EUR || 600);
 const DATA_DIR = process.env.DATA_DIR || '.';
-
-fs.mkdirSync(DATA_DIR, { recursive: true });
-
-const SUBSCRIBERS_FILE = path.join(DATA_DIR, 'subscribers.json');
-const STATE_FILE = path.join(DATA_DIR, 'offers.json');
-
-const bot = new TelegramBot(TOKEN, { polling: true });
-
-const sources = [
-  {
-    name: 'Pokémonitor',
-    version: 'Giorno',
-    kind: 'tracker',
-    url: 'https://pokemonitoritalia.com/set/megaevoluzioni/30-anniversario/collezione-ultra-premium-giornata'
-  },
-  {
-    name: 'Pokémonitor',
-    version: 'Notte',
-    kind: 'tracker',
-    url: 'https://pokemonitoritalia.com/set/megaevoluzioni/30-anniversario/collezione-ultra-premium-serata'
-  },
-  {
-    name: 'Card Restock Tracker',
-    version: 'Giorno',
-    kind: 'tracker',
-    url: 'https://cardrestocktracker.com/it/30-anniversario-ultra-premium-collection-versione-giorno-1h6cvz1'
-  },
-  {
-    name: 'Card Restock Tracker',
-    version: 'Notte',
-    kind: 'tracker',
-    url: 'https://cardrestocktracker.com/it/30-anniversario-ultra-premium-collection-versione-notte-bqq9av'
-  },
-  {
-    name: 'TakiCardz',
-    version: 'Giorno',
-    kind: 'shopify',
-    url: 'https://takicardz.it/products/30-anniversario-espeon-ultra-premium-collection'
-  },
-  {
-    name: 'TakiCardz',
-    version: 'Notte',
-    kind: 'shopify',
-    url: 'https://takicardz.it/products/30-anniversario-notte-ultra-premium-collection'
-  },
-  {
-    name: 'Amber Road',
-    version: 'Notte',
-    kind: 'generic',
-    url: 'https://www.amberroadtcg.com/en/shop/collezione-speciale-ultra-premium-30-anniversario/umbreon'
-  },
-  {
-    name: 'Pokechrono',
-    version: 'Notte',
-    kind: 'generic',
-    url: 'https://pokechrono.com/it/negozio/collezione-ultra-premium-umbreon-ex-30-anniversario'
-  }
+const STATE_FILE = path.join(DATA_DIR, 'pokemon-bot-state.json');
+const ADMIN_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '');
+const LOCK_FILE = path.join(DATA_DIR, '.pokemon-bot.lock');
+const USER_AGENT = 'Mozilla/5.0 (compatible; PokemonUPCMonitor/2.0; +personal-monitor)';
+const SOURCES = [
+  {name:'Pokémonitor Giorno',kind:'tracker',variant:'giorno',url:'https://pokemonitoritalia.com/set/megaevoluzioni/30-anniversario/collezione-ultra-premium-giornata'},
+  {name:'Pokémonitor Notte',kind:'tracker',variant:'notte',url:'https://pokemonitoritalia.com/set/megaevoluzioni/30-anniversario/collezione-ultra-premium-serata'},
+  {name:'Card Restock Tracker Giorno',kind:'tracker',variant:'giorno',url:'https://cardrestocktracker.com/it/30-anniversario-ultra-premium-collection-versione-giorno-1h6cvz1'},
+  {name:'Card Restock Tracker Notte',kind:'tracker',variant:'notte',url:'https://cardrestocktracker.com/it/30-anniversario-ultra-premium-collection-versione-notte-bqq9av'},
+  {name:'TakiCardz Giorno',kind:'shop',variant:'giorno',url:'https://takicardz.it/products/30-anniversario-espeon-ultra-premium-collection'},
+  {name:'TakiCardz Notte',kind:'shop',variant:'notte',url:'https://takicardz.it/products/30-anniversario-notte-ultra-premium-collection'},
+  {name:'Amber Road Notte',kind:'shop',variant:'notte',url:'https://www.amberroadtcg.com/en/shop/collezione-speciale-ultra-premium-30-anniversario/umbreon'},
+  {name:'Pokechrono Notte',kind:'shop',variant:'notte',url:'https://pokechrono.com/it/negozio/collezione-ultra-premium-umbreon-ex-30-anniversario'}
 ];
 
-function readJson(file, fallback) {
-  try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return fallback;
+const sleep = ms => new Promise(r => setTimeout(r,ms));
+const log = (...args) => console.log(new Date().toISOString(),...args);
+function loadState(){try { const s=JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); return {chats:s.chats||[],sent:s.sent||{},offset:s.offset||0,seen:s.seen||{}}; }catch{return {chats:[],sent:{},offset:0,seen:{}};}}
+let state=loadState();
+function saveState(){try{fs.mkdirSync(DATA_DIR,{recursive:true});const tmp=STATE_FILE+'.tmp';fs.writeFileSync(tmp,JSON.stringify(state,null,2));fs.renameSync(tmp,STATE_FILE);}catch(e){log('WARN: state not persisted:',e.message);}}
+function htmlDecode(s){return String(s||'').replace(/&quot;/g,'"').replace(/&#39;|&apos;/g,"'").replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>');}
+function stripHtml(s){return htmlDecode(String(s||'').replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi,' ').replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi,' ').replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim());}
+function parsePrice(value){if(typeof value==='number')return Number.isFinite(value)?value:null;if(value==null)return null;let s=String(value).replace(/[^\d.,]/g,'');if(!s)return null; if(s.includes(',')&&s.includes('.'))s=s.lastIndexOf(',')>s.lastIndexOf('.')?s.replace(/\./g,'').replace(',','.'):s.replace(/,/g,'');else if(s.includes(','))s=s.replace(',','.');else if(/^\d{1,3}\.\d{3}$/.test(s))s=s.replace('.','');const n=Number(s);return Number.isFinite(n)?n:null;}
+function normalizeVariant(title){const t=String(title||'').toLowerCase();if(/espeon|giorn(?:o|ata)|day(?:time)?/.test(t))return 'giorno';if(/umbreon|nott(?:e|urna)|serata|night/.test(t))return 'notte';return null;}
+function relevant(title,variant){const t=String(title||'').toLowerCase();return normalizeVariant(t)===variant && /(ultra.premium|upc|30.anniversario|30th)/i.test(t);}
+function absoluteUrl(href,base){try{const u=new URL(htmlDecode(href),base);return /^https?:$/.test(u.protocol)?u.href:null;}catch{return null;}}
+async function fetchText(url){const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),12000);try{const res=await fetch(url,{headers:{'User-Agent':USER_AGENT,'Accept':'text/html,application/json'},signal:ctrl.signal,redirect:'follow'});if(!res.ok)throw Error(`HTTP ${res.status}`);const text=await res.text();if(text.length>3_000_000)throw Error('Response too large');return {text,url:res.url,type:res.headers.get('content-type')||''};}finally{clearTimeout(timer);}}
+async function telegram(method,params={}){const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),35000);try{const res=await fetch(`${API}/${method}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(params),signal:ctrl.signal});const data=await res.json();if(!data.ok)throw Error(`${data.error_code||res.status}: ${data.description||'Telegram error'}`);return data.result;}finally{clearTimeout(timer);}}
+async function send(chat,text){try{await telegram('sendMessage',{chat_id:chat,text,disable_web_page_preview:true});return true;}catch(e){log('TELEGRAM SEND FAILED',chat,e.message);return false;}}
+function collectJsonLd(html){const items=[];for(const m of html.matchAll(/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)){try{const raw=JSON.parse(htmlDecode(m[1]));const walk=(o)=>{if(!o||typeof o!=='object')return;if(Array.isArray(o)){o.forEach(walk);return;}if(o['@type']&&(String(o['@type']).toLowerCase().includes('product')))items.push(o);if(o['@graph'])walk(o['@graph']);};walk(raw);}catch{}}return items;}
+function availabilityStatus(raw){const t=String(raw||'').toLowerCase();if(/outofstock|soldout|discontinued|esaurit|non.disponib/.test(t))return 'out';if(/preorder|pre-order|preordine|pre.order/.test(t))return 'preorder';if(/instock|in.stock|limitedavailability|disponibil/.test(t))return 'available';return 'unknown';}
+function extractJsonLdOffers(html,source,finalUrl){const result=[];for(const p of collectJsonLd(html)){const title=String(p.name||'');if(!relevant(title,source.variant))continue;const offers=Array.isArray(p.offers)?p.offers:[p.offers];for(const o of offers){if(!o||typeof o!=='object')continue;const price=parsePrice(o.price??o.lowPrice);const currency=String(o.priceCurrency||'EUR').toUpperCase();const status=availabilityStatus(o.availability);if(price===null||currency!=='EUR'||status==='unknown'||status==='out')continue;const direct=absoluteUrl(o.url||p.url||finalUrl,finalUrl);if(!direct)continue;result.push({source:source.name,variant:source.variant,title,price,status,url:direct,shipping:'Da verificare al checkout',evidence:'JSON-LD'});}}return result;}
+async function extractShopify(source,finalUrl){let u;try{u=new URL(finalUrl);}catch{return [];}const m=u.pathname.match(/\/products\/([^/?#]+)/);if(!m)return [];const endpoint=`${u.origin}/products/${m[1]}.js`;let data;try{const r=await fetchText(endpoint);data=JSON.parse(r.text);}catch{return [];}if(!relevant(data.title,source.variant))return [];if(!Array.isArray(data.variants))return [];const available=data.variants.filter(v=>v.available===true&&Number.isFinite(Number(v.price)));if(!available.length)return [];const price=Math.min(...available.map(v=>Number(v.price)/100));return [{source:source.name,variant:source.variant,title:data.title,price,status:'available',url:finalUrl,shipping:'Da verificare al checkout',evidence:'Shopify variant available=true'}];}
+function discoverTrackerLinks(html,base){const found=[];for(const m of html.matchAll(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)){const label=stripHtml(m[2]);const url=absoluteUrl(m[1],base);if(!url||!/^https?:/.test(url))continue;if(/ultra.premium|30.anniversario|espeon|umbreon/i.test(label+' '+url))found.push({label,url});}return found.slice(0,25);}
+async function inspectSource(source){const page=await fetchText(source.url);if(source.kind==='tracker'){
+  // Tracker links are discovery hints only. Never convert generic tracker text into availability.
+  const links=discoverTrackerLinks(page.text,page.url);
+  const candidates=links.filter(l=>{try{return new URL(l.url).hostname!==new URL(page.url).hostname;}catch{return false;}}).filter(l=>normalizeVariant(l.label+' '+l.url)===source.variant);
+  const offers=[];
+  for(const link of candidates.slice(0,5)){
+    try{const target={name:`${source.name} → ${new URL(link.url).hostname}`,kind:'shop',variant:source.variant,url:link.url};const page2=await fetchText(link.url);offers.push(...extractJsonLdOffers(page2.text,target,page2.url),...await extractShopify(target,page2.url));}catch(e){log('Tracker candidate error',link.url,e.message);}
   }
+  return {offers,details:`${links.length} link trovati, ${candidates.length} candidati esterni`};
 }
-
-function writeJson(file, value) {
-  const temp = file + '.tmp';
-  fs.writeFileSync(temp, JSON.stringify(value, null, 2));
-  fs.renameSync(temp, file);
-}
-
-let subscribers = new Set(readJson(SUBSCRIBERS_FILE, []));
-let previousOffers = readJson(STATE_FILE, {});
-
-function saveSubscribers() {
-  writeJson(SUBSCRIBERS_FILE, [...subscribers]);
-}
-
-function saveOffers() {
-  writeJson(STATE_FILE, previousOffers);
-}
-
-function normalizeText(value) {
-  return String(value || '')
-    .replace(/<script\b[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style\b[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<[^>]*>/g, ' ')
-    .replace(/&nbsp;|&#160;/gi, ' ')
-    .replace(/&euro;|&#8364;/gi, '€')
-    .replace(/&amp;/gi, '&')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function parsePrice(value) {
-  if (value === undefined || value === null) return null;
-
-  let s = String(value).trim().replace(/[^\d.,]/g, '');
-  if (!s) return null;
-
-  if (s.includes(',') && s.includes('.')) {
-    if (s.lastIndexOf(',') > s.lastIndexOf('.')) {
-      s = s.replace(/\./g, '').replace(',', '.');
-    } else {
-      s = s.replace(/,/g, '');
-    }
-  } else if (s.includes(',')) {
-    s = s.replace(',', '.');
-  }
-
-  const n = Number(s);
-  return Number.isFinite(n) && n > 0 ? n : null;
-}
-
-function money(value) {
-  return new Intl.NumberFormat('it-IT', {
-    style: 'currency',
-    currency: 'EUR'
-  }).format(value);
-}
-
-function matchesVersion(text, version) {
-  const t = String(text || '').toLowerCase();
-
-  if (version === 'Giorno') {
-    return /espeon|giorno|day|giornata/.test(t) &&
-      !/umbreon/.test(t);
-  }
-
-  return /umbreon|notte|night|serata/.test(t) &&
-    !/espeon/.test(t);
-}
-
-function availability(value) {
-  const s = String(value || '').toLowerCase();
-
-  if (/outofstock|sold.?out|esaurit|non disponibile/.test(s)) {
-    return 'esaurito';
-  }
-
-  if (/pre.?order|pre.?sale|preordine|prenotabile/.test(s)) {
-    return 'preordine';
-  }
-
-  if (/instock|disponibile|available|in stock/.test(s)) {
-    return 'disponibile';
-  }
-
-  return null;
-}
-
-async function fetchPage(url) {
-  const response = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
-      'Accept-Language': 'it-IT,it;q=0.9,en;q=0.8'
-    },
-    signal: AbortSignal.timeout(TIMEOUT),
-    redirect: 'follow'
-  });
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
-
-  return response.text();
-}
-
-function collectProducts(data, output = []) {
-  if (!data || typeof data !== 'object') return output;
-
-  if (Array.isArray(data)) {
-    for (const item of data) collectProducts(item, output);
-    return output;
-  }
-
-  const types = Array.isArray(data['@type'])
-    ? data['@type']
-    : [data['@type']];
-
-  if (types.includes('Product')) output.push(data);
-
-  for (const value of Object.values(data)) {
-    if (value && typeof value === 'object') {
-      collectProducts(value, output);
-    }
-  }
-
-  return output;
-}
-
-function jsonLdOffers(html, source) {
-  const products = [];
-  const scripts = html.matchAll(
-    /<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
-  );
-
-  for (const match of scripts) {
-    try {
-      collectProducts(JSON.parse(match[1]), products);
-    } catch {
-      // Ignora JSON-LD non valido
-    }
-  }
-
-  const found = [];
-
-  for (const product of products) {
-    if (!matchesVersion(product.name, source.version)) continue;
-
-    const offers = Array.isArray(product.offers)
-      ? product.offers
-      : [product.offers];
-
-    for (const offer of offers) {
-      if (!offer) continue;
-
-      const currency = String(offer.priceCurrency || 'EUR').toUpperCase();
-      if (currency !== 'EUR') continue;
-
-      const price = parsePrice(offer.price || offer.lowPrice);
-      const status = availability(offer.availability);
-
-      if (!price || !status || status === 'esaurito') continue;
-
-      found.push({
-        shop: source.name,
-        version: source.version,
-        price,
-        status,
-        url: source.url,
-        shipping: 'Da verificare al checkout'
-      });
-    }
-  }
-
-  return found;
-}
-
-async function shopifyOffers(source) {
-  const parsed = new URL(source.url);
-  const match = parsed.pathname.match(/\/products\/([^/]+)/);
-
-  if (!match) return [];
-
-  const endpoint =
-    `${parsed.origin}/products/${match[1]}.js`;
-
-  const response = await fetch(endpoint, {
-    headers: { 'User-Agent': 'Mozilla/5.0' },
-    signal: AbortSignal.timeout(TIMEOUT)
-  });
-
-  if (!response.ok) {
-    throw new Error(`Shopify HTTP ${response.status}`);
-  }
-
-  const product = await response.json();
-
-  if (!matchesVersion(product.title, source.version)) return [];
-
-  const results = [];
-
-  for (const variant of product.variants || []) {
-    if (!variant.available) continue;
-
-    const price = Number(variant.price) / 100;
-    if (!Number.isFinite(price) || price <= 0) continue;
-
-    results.push({
-      shop: source.name,
-      version: source.version,
-      price,
-      status: 'disponibile',
-      url: source.url,
-      shipping: 'Da verificare al checkout'
-    });
-  }
-
-  return results;
-}
-
-/*
- * Tracker: lettura prudente.
- * Cerca link esterni accompagnati da prezzo e disponibilità
- * nel testo vicino al link. Se i dati non sono chiari,
- * non genera notifiche.
- */
-function trackerOffers(html, source) {
-  const results = [];
-  const anchors = html.matchAll(
-    /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi
-  );
-
-  const plain = normalizeText(html);
-  const pageAvailability = availability(plain);
-
-  for (const match of anchors) {
-    let productUrl;
-
-    try {
-      productUrl = new URL(match[1], source.url);
-    } catch {
-      continue;
-    }
-
-    if (!['http:', 'https:'].includes(productUrl.protocol)) continue;
-
-    const trackerHost = new URL(source.url).hostname;
-    if (productUrl.hostname === trackerHost) continue;
-
-    const index = match.index || 0;
-    const context = normalizeText(
-      html.slice(Math.max(0, index - 700), index + 1400)
-    );
-
-    if (!matchesVersion(context, source.version)) continue;
-
-    const priceMatches = [
-      ...context.matchAll(/(?:€\s*)?(\d{1,4}(?:[.,]\d{2})?)\s*€/g)
-    ];
-
-    if (!priceMatches.length) continue;
-
-    const price = parsePrice(priceMatches[0][1]);
-    if (!price) continue;
-
-    const status = availability(context) || pageAvailability;
-    if (!status || status === 'esaurito') continue;
-
-    results.push({
-      shop: productUrl.hostname.replace(/^www\./, ''),
-      version: source.version,
-      price,
-      status,
-      url: productUrl.href,
-      shipping: 'Da verificare al checkout'
-    });
-  }
-
-  return results;
-}
-
-async function getOffers(source) {
-  const html = await fetchPage(source.url);
-
-  if (source.kind === 'shopify') {
-    return shopifyOffers(source);
-  }
-
-  const structured = jsonLdOffers(html, source);
-
-  if (structured.length) return structured;
-
-  if (source.kind === 'tracker') {
-    return trackerOffers(html, source);
-  }
-
-  return [];
-}
-
-function makeKey(offer) {
-  return [
-    offer.version,
-    offer.shop.toLowerCase(),
-    offer.url
-  ].join('|');
-}
-
-function offerSignature(offer) {
-  return `${offer.status}|${offer.price.toFixed(2)}`;
-}
-
-async function sendOffer(offer) {
-  const message = [
-    '🎯 *POKÉMON UPC 30° ANNIVERSARIO*',
-    '',
-    `📦 Versione: *${offer.version}*`,
-    `🏪 Negozio: *${offer.shop}*`,
-    `💶 Prezzo: *${money(offer.price)}*`,
-    `📌 Stato: *${offer.status}*`,
-    `🚚 Spedizione Italia: ${offer.shipping}`,
-    '',
-    `🔗 ${offer.url}`,
-    '',
-    'Controlla subito disponibilità e condizioni sul sito.'
-  ].join('\n');
-
-  let delivered = 0;
-
-  for (const chatId of subscribers) {
-    try {
-      await bot.sendMessage(chatId, message, {
-        parse_mode: 'Markdown',
-        disable_web_page_preview: false
-      });
-      delivered++;
-    } catch (error) {
-      console.error(`Invio Telegram fallito per ${chatId}:`, error.message);
-
-      if (
-        error.response &&
-        [403, 400].includes(error.response.statusCode)
-      ) {
-        subscribers.delete(chatId);
-        saveSubscribers();
-      }
-    }
-  }
-
-  return delivered > 0;
-}
-
-async function processOffer(offer) {
-  if (!offer.price || offer.price > MAX_PRICE) return;
-  if (!offer.url || !/^https?:\/\//i.test(offer.url)) return;
-  if (!['disponibile', 'preordine'].includes(offer.status)) return;
-
-  const key = makeKey(offer);
-  const signature = offerSignature(offer);
-
-  if (previousOffers[key] === signature) return;
-
-  const delivered = await sendOffer(offer);
-
-  if (delivered) {
-    previousOffers[key] = signature;
-    saveOffers();
-    console.log('Notifica inviata:', key, signature);
-  }
-}
-
-let running = false;
-
-async function checkAll() {
-  if (running) return;
-  running = true;
-
-  console.log('Controllo fonti:', new Date().toISOString());
-
-  try {
-    for (const source of sources) {
-      try {
-        const offers = await getOffers(source);
-
-        console.log(
-          `${source.name} ${source.version}: ${offers.length} offerte rilevate`
-        );
-
-        for (const offer of offers) {
-          await processOffer(offer);
-        }
-      } catch (error) {
-        console.error(
-          `Errore ${source.name} ${source.version}:`,
-          error.message
-        );
-      }
-    }
-  } finally {
-    running = false;
-  }
-}
-
-bot.onText(/^\/start$/, async msg => {
-  const id = String(msg.chat.id);
-  subscribers.add(id);
-  saveSubscribers();
-
-  await bot.sendMessage(
-    id,
-    '✅ *Bot Pokémon UPC attivato!*\n\n' +
-    'Riceverai avvisi per Giorno (Espeon) e Notte (Umbreon), ' +
-    'con prezzo massimo di 300 € per box.\n\n' +
-    'Controllo automatico ogni 60 secondi.\n\n' +
-    '/check - Controlla subito\n' +
-    '/status - Stato del monitoraggio',
-    { parse_mode: 'Markdown' }
-  );
-});
-
-bot.onText(/^\/status$/, async msg => {
-  const id = String(msg.chat.id);
-
-  await bot.sendMessage(
-    id,
-    `Monitoraggio attivo.\n` +
-    `Fonti configurate: ${sources.length}\n` +
-    `Intervallo: 60 secondi\n` +
-    `Prezzo massimo: ${MAX_PRICE} €\n` +
-    `Iscritti: ${subscribers.size}\n` +
-    `Versioni: Giorno e Notte`
-  );
-});
-
-bot.onText(/^\/check$/, async msg => {
-  const id = String(msg.chat.id);
-
-  await bot.sendMessage(id, '🔎 Avvio controllo manuale...');
-
-  await checkAll();
-
-  await bot.sendMessage(id, '✅ Controllo terminato. Se non sono arrivate offerte, non ne sono state rilevate di verificabili sotto 300 €.');
-});
-
-bot.on('polling_error', error => {
-  console.error('Errore Telegram polling:', error.message);
-});
-
-bot.on('error', error => {
-  console.error('Errore bot:', error.message);
-});
-
-console.log('Bot Pokémon UPC avviato.');
-console.log(`Fonti configurate: ${sources.length}`);
-console.log('Intervallo di controllo: 60 secondi.');
-
-checkAll();
-
-setInterval(() => {
-  checkAll();
-}, INTERVAL);
+const offers=[...extractJsonLdOffers(page.text,source,page.url),...await extractShopify(source,page.url)];return {offers,details:`${offers.length} offerte strutturate`};}
+function offerKey(o){return crypto.createHash('sha256').update([o.variant,o.url,o.price,o.status].join('|')).digest('hex');}
+let checking=false;let lastCheck='mai';let lastSummary='nessun controllo';
+async function checkAll({notify=true}={}){if(checking)return 'Controllo già in corso';checking=true;lastCheck=new Date().toISOString();let offers=[],errors=0;try{for(const source of SOURCES){try{const r=await inspectSource(source);log(source.name,r.details,`valide=${r.offers.length}`);offers.push(...r.offers);}catch(e){errors++;log('SOURCE ERROR',source.name,e.message);}}
+const dedup=new Map();for(const o of offers){if(o.price<=MAX_BOX&&o.price>0){const key=offerKey(o);dedup.set(key,o);}}
+let delivered=0;for(const [key,o] of dedup){const previous=state.sent[key];if(previous)continue;const msg=`🚨 Pokémon UPC 30° anniversario\n📦 ${o.variant==='giorno'?'Giorno / Espeon':'Notte / Umbreon'}\n🏬 ${o.source}\n💶 ${o.price.toFixed(2)} € (limite ${MAX_BOX} €)\n🟢 ${o.status==='preorder'?'Preordine':'Disponibile'}\n🚚 Spedizione in Italia: ${o.shipping}\n🔗 ${o.url}\n🔎 Verifica: ${o.evidence}\n⚠️ Controlla disponibilità e spedizione prima di acquistare.`;
+const chats=[...new Set([...state.chats,...(ADMIN_CHAT_ID?[ADMIN_CHAT_ID]:[])])];if(!chats.length){log('NO SUBSCRIBERS: send /start to bot or set TELEGRAM_CHAT_ID');continue;}let allSent=true;for(const chat of chats){if(await send(chat,msg))delivered++;else allSent=false;}if(allSent){state.sent[key]=new Date().toISOString();saveState();}}
+lastSummary=`${SOURCES.length} fonti, ${errors} errori, ${dedup.size} offerte entro ${MAX_BOX} €, ${delivered} messaggi inviati`;
+log('CHECK COMPLETE',lastSummary);return lastSummary;
+}finally{checking=false;}}
+async function handleUpdate(update){const msg=update.message;if(!msg?.chat?.id||typeof msg.text!=='string')return;const chat=String(msg.chat.id);const cmd=msg.text.trim().split(/\s+/)[0].split('@')[0].toLowerCase();if(cmd==='/start'){if(!state.chats.includes(chat)){state.chats.push(chat);saveState();}await send(chat,'✅ Iscritto agli avvisi Pokémon UPC. Controllo ogni 60 secondi. Comandi: /test /status /check /stop.');}else if(cmd==='/test'){await send(chat,'✅ Messaggio di prova Telegram ricevuto. Questo verifica Telegram, non la disponibilità dei prodotti.');}else if(cmd==='/status'){await send(chat,`🤖 Bot attivo\nUltimo controllo: ${lastCheck}\n${lastSummary}\nLimite: ${MAX_BOX} € a scatola; ${MAX_PAIR} € per coppia.\nIscritti: ${state.chats.length}`);}else if(cmd==='/check'){await send(chat,'🔎 Controllo avviato.');const result=await checkAll();await send(chat,`Controllo concluso: ${result}`);}else if(cmd==='/stop'){state.chats=state.chats.filter(x=>x!==chat);saveState();await send(chat,'Notifiche disattivate. /start per riattivarle.');}}
+async function pollingLoop(){while(true){try{const updates=await telegram('getUpdates',{offset:state.offset,timeout:25,allowed_updates:['message']});for(const update of updates){try{await handleUpdate(update);}catch(e){log('UPDATE ERROR',e.message);}state.offset=update.update_id+1;saveState();}}catch(e){log('TELEGRAM POLLING ERROR',e.message);if(/409/.test(e.message))log('CONFLICT 409: another instance is polling this token. Stop the other instance; deleteWebhook cannot fix concurrent polling.');await sleep(5000);}}}
+async function main(){try{fs.mkdirSync(DATA_DIR,{recursive:true});}catch{};if(ADMIN_CHAT_ID&&!state.chats.includes(ADMIN_CHAT_ID)){state.chats.push(ADMIN_CHAT_ID);saveState();}try{await telegram('deleteWebhook',{drop_pending_updates:false});log('Webhook cleared');}catch(e){log('Webhook warning',e.message);}try{const me=await telegram('getMe');log('TELEGRAM AUTH OK',me.username);}catch(e){log('TELEGRAM AUTH FAILED',e.message);process.exit(1);}log(`MONITOR STARTED: ${SOURCES.length} sources, interval=${INTERVAL}ms, max=${MAX_BOX}€`);void pollingLoop();await checkAll();setInterval(()=>{void checkAll();},INTERVAL);}
+main().catch(e=>{log('FATAL',e.stack||e.message);process.exit(1);});
